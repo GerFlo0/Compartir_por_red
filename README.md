@@ -8,8 +8,49 @@ Comparte una carpeta local por HTTP para que cualquier dispositivo de la misma r
 |---|---|
 | `compartir_red.py` | Aplicación completa (interfaz + servidor). Único archivo necesario. |
 | `icon.png` / `icon.ico` | Icono de la ventana y del ejecutable. Se cargan solos si están junto al `.py`. |
+| `requirements.txt` | Dependencias opcionales, para instalar todas de una vez. |
 
-## 2. Requisitos
+## 2. Entorno virtual
+
+Recomendado para no mezclar las dependencias del proyecto con las del sistema.
+
+### Linux / macOS
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Si tkinter no está disponible dentro del venv (viene del sistema, no de pip):
+
+```bash
+sudo apt install python3-tk      # Debian/Ubuntu
+sudo dnf install python3-tkinter # Fedora
+```
+
+### Windows
+
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Para salir del entorno en cualquier plataforma: `deactivate`.
+
+`requirements.txt`:
+
+```
+qrcode
+tkinterdnd2
+psutil
+pillow
+```
+
+(`pillow` solo hace falta si vas a regenerar el icono con `--crear-icono`; el resto son opcionales para la app pero se recomiendan para tener QR, arrastrar y soltar, y detección completa de interfaces.)
+
+## 3. Requisitos
 
 | Paquete | Obligatorio | Para qué |
 |---|---|---|
@@ -19,15 +60,9 @@ Comparte una carpeta local por HTTP para que cualquier dispositivo de la misma r
 | `psutil` | No | Nombre real de cada interfaz de red (`pip install psutil`) |
 | `pillow` | No | Solo para regenerar el icono (`pip install pillow`) |
 
-Instalación recomendada de una sola vez:
-
-```bash
-pip install qrcode tkinterdnd2 psutil pillow
-```
-
 Sin las opcionales la app funciona igual: el QR se sustituye por un aviso y el arrastrar y soltar queda deshabilitado.
 
-## 3. Uso
+## 4. Uso
 
 ```bash
 python compartir_red.py
@@ -43,7 +78,7 @@ python compartir_red.py --crear-icono     # regenera icon.png / icon.ico
 - **Escuchar solo en esta IP**: sin marcar, el servidor escucha en `0.0.0.0` (accesible por todas las interfaces); marcado, solo por la IP seleccionada. Selecciona `127.0.0.1` + esa casilla para una prueba local que nadie más ve.
 - El panel **Actividad** registra cada petición, con IP del dispositivo, y los contadores muestran conexiones activas, dispositivos distintos, descargas y bytes enviados.
 
-## 4. Lo que ve quien entra
+## 5. Lo que ve quien entra
 
 Listado propio (responsive, modo oscuro automático) con:
 
@@ -57,55 +92,86 @@ Listado propio (responsive, modo oscuro automático) con:
 
 El `.zip` se genera **al vuelo** con `Transfer-Encoding: chunked` y `ZIP_STORED`: no crea archivos temporales, no consume RAM proporcional al tamaño y la descarga empieza al instante (soporta >4 GB con Zip64). Los archivos y carpetas ocultos (`.algo`) se omiten tanto del listado como del zip.
 
-## 5. Notas técnicas
+## 6. Notas técnicas
 
 - Usa `SimpleHTTPRequestHandler(directory=...)` mediante `functools.partial`: **nunca** se llama a `os.chdir()`, el directorio de trabajo del proceso queda intacto.
 - `ThreadingHTTPServer` + `protocol_version = "HTTP/1.1"`: varias descargas simultáneas y conexiones persistentes (probado con 12 zips en paralelo).
 - Rutas confinadas a la carpeta compartida (`translate_path` + verificación con `os.path.commonpath`); los intentos de `../` devuelven 404/403.
 - El servidor corre en un hilo demonio; la interfaz se comunica con él por una `Queue` y un `root.after()`, sin tocar widgets desde otros hilos.
 
-## 6. Convertirlo en aplicación con icono
+## 7. Convertirlo en ejecutable
+
+PyInstaller empaqueta para el sistema **en el que lo ejecutas**: no se puede generar el `.exe` de Windows desde Linux ni viceversa. Corre el comando correspondiente en cada SO (activando primero el entorno virtual del paso 2).
 
 ### Windows (.exe)
 
 ```bat
+venv\Scripts\activate
 pip install pyinstaller
-pyinstaller --noconsole --onefile --icon icon.ico ^
+
+pyinstaller --noconfirm --onefile --windowed ^
+  --name "CompartirRed" ^
+  --icon icon.ico ^
   --add-data "icon.png;." --add-data "icon.ico;." ^
-  --name "CompartirRed" compartir_red.py
+  --collect-all tkinterdnd2 ^
+  --hidden-import qrcode ^
+  compartir_red.py
 ```
 
-El ejecutable queda en `dist\CompartirRed.exe`. Si usas `tkinterdnd2` añade `--collect-all tkinterdnd2`.
+El ejecutable queda en `dist\CompartirRed.exe`, listo para copiar a otra PC Windows **sin Python instalado**.
 
-> Al primer arranque Windows Defender pedirá permiso de red: marca **Redes privadas** y acepta. Si no, ábrelo manualmente:
+> Al primer arranque Windows Defender pedirá permiso de red: marca **Redes privadas** y acepta. Si no aparece el aviso:
 > `netsh advfirewall firewall add rule name="CompartirRed" dir=in action=allow protocol=TCP localport=8000`
 
-### Linux (.desktop)
+### Linux (binario + .desktop)
 
 ```bash
+source venv/bin/activate
 pip install pyinstaller
-pyinstaller --noconsole --onefile --add-data "icon.png:." --name compartir-red compartir_red.py
-mkdir -p ~/.local/share/icons && cp icon.png ~/.local/share/icons/compartir-red.png
+
+pyinstaller --noconfirm --onefile --windowed \
+  --name CompartirRed \
+  --icon icon.ico \
+  --add-data "icon.png:." --add-data "icon.ico:." \
+  --collect-all tkinterdnd2 \
+  --hidden-import qrcode \
+  compartir_red.py
 ```
 
-`~/.local/share/applications/compartir-red.desktop`:
+El binario queda en `dist/CompartirRed` y corre en otra máquina Linux compatible **sin Python instalado** (solo necesita las librerías gráficas de Tk/X11 que trae cualquier distro con escritorio).
 
-```ini
+En Linux, un ejecutable (ELF) no puede llevar un icono incrustado como en Windows — por eso **siempre** se ve el icono genérico si abres el binario directo desde el gestor de archivos. Para que el icono correcto aparezca en el menú de aplicaciones y en la barra de tareas, instala un lanzador `.desktop`:
+
+```bash
+mkdir -p ~/.local/share/icons/hicolor/256x256/apps
+cp icon.png ~/.local/share/icons/hicolor/256x256/apps/compartir-red.png
+gtk-update-icon-cache -f ~/.local/share/icons/hicolor
+
+mkdir -p ~/.local/share/applications
+cat > ~/.local/share/applications/compartir-red.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Compartir por red
 Comment=Comparte una carpeta por HTTP en la red local
-Exec=/ruta/completa/a/dist/compartir-red
+Exec=/ruta/completa/a/dist/CompartirRed
 Icon=compartir-red
 Terminal=false
 Categories=Network;FileTransfer;Utility;
+StartupWMClass=CompartirRed
+EOF
+
+chmod +x ~/.local/share/applications/compartir-red.desktop
+update-desktop-database ~/.local/share/applications
 ```
 
-Luego: `update-desktop-database ~/.local/share/applications`
+Notas:
 
-Si prefieres no empaquetar, usa `Exec=python3 /ruta/compartir_red.py`.
+- `StartupWMClass=CompartirRed` hace que el icono también se vea en la barra de tareas / Alt-Tab, no solo en el menú.
+- Si lo pones en el Escritorio y lo abres con doble clic, GNOME Files puede bloquearlo: clic derecho → **Permitir lanzamiento** (o `gio set archivo.desktop metadata::trusted true` + `chmod +x`).
+- Si prefieres no empaquetar, usa `Exec=/ruta/al/venv/bin/python3 /ruta/compartir_red.py` en el `.desktop` en lugar del binario.
+- Verifica la sintaxis del `.desktop` con `desktop-file-validate archivo.desktop` (paquete `desktop-file-utils`) si el icono no aparece y no sabes por qué.
 
-## 7. Seguridad
+## 8. Seguridad
 
 - **No hay autenticación**: cualquiera en la red con la dirección puede ver y descargar la carpeta. Úsalo en redes de confianza y detén el servidor al terminar.
 - Es solo lectura: no permite subir, borrar ni modificar nada.
