@@ -1,0 +1,24 @@
+# Entorno virtual
+.venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Bytecode / cache de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Empaquetado
+*.egg-info/
+*.egg
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editores
+.vscode/
+.idea/
