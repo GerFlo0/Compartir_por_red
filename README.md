@@ -109,7 +109,7 @@ PyInstaller empaqueta para el sistema **en el que lo ejecutas**: no se puede gen
 venv\Scripts\activate
 pip install pyinstaller
 
-pyinstaller --noconfirm --onefile --windowed ^
+pyinstaller --noconfirm --onedir --noupx --windowed ^
   --name "CompartirRed" ^
   --icon icon.ico ^
   --add-data "icon.png;." --add-data "icon.ico;." ^
@@ -129,7 +129,7 @@ El ejecutable queda en `dist\CompartirRed.exe`, listo para copiar a otra PC Wind
 source venv/bin/activate
 pip install pyinstaller
 
-pyinstaller --noconfirm --onefile --windowed \
+pyinstaller --noconfirm --onedir --noupx --windowed \
   --name CompartirRed \
   --icon icon.ico \
   --add-data "icon.png:." --add-data "icon.ico:." \
