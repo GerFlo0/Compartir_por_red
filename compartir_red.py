@@ -508,12 +508,58 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
 # =============================================================================
 #  SERVIDOR
 # =============================================================================
+class ServidorHTTPCerrable(ThreadingHTTPServer):
+    """ThreadingHTTPServer que puede matar sus conexiones persistentes (keep-alive).
+
+    httpd.shutdown() por sí solo NO alcanza: solo detiene el bucle que acepta
+    conexiones NUEVAS. Los clientes que ya tenían una conexión HTTP/1.1 abierta
+    (cualquier pestaña de navegador ya cargada) se quedan con su hilo vivo y
+    siguen siendo atendidos indefinidamente. Por eso rastreamos cada socket
+    aceptado y, al detener, los cerramos explícitamente por la fuerza.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._conexiones: set = set()
+        self._lock_conexiones = threading.Lock()
+
+    def process_request(self, request, client_address):
+        with self._lock_conexiones:
+            self._conexiones.add(request)
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request) -> None:
+        with self._lock_conexiones:
+            self._conexiones.discard(request)
+        super().shutdown_request(request)
+
+    def handle_error(self, request, client_address) -> None:
+        # Cerrar sockets a la fuerza desde otro hilo genera ConnectionError/OSError
+        # esperados en el hilo que atendía esa conexión: no son fallas reales.
+        pass
+
+    def cerrar_conexiones_activas(self) -> None:
+        with self._lock_conexiones:
+            conexiones = list(self._conexiones)
+        for sock in conexiones:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 class ServidorCompartir:
     def __init__(self, carpeta: str, puerto: int, bind: str, estado: Estado) -> None:
         # directory=... evita os.chdir(): no se toca el directorio global del proceso.
         manejador = partial(ManejadorCompartir, directory=carpeta, estado=estado)
-        self.httpd = ThreadingHTTPServer((bind, puerto), manejador)
-        self.httpd.daemon_threads = True
+        self.httpd = ServidorHTTPCerrable((bind, puerto), manejador)
         self.hilo = threading.Thread(target=self.httpd.serve_forever,
                                      name="http-compartir", daemon=True)
 
@@ -521,7 +567,8 @@ class ServidorCompartir:
         self.hilo.start()
 
     def detener(self) -> None:
-        self.httpd.shutdown()
+        self.httpd.shutdown()                    # deja de aceptar conexiones nuevas
+        self.httpd.cerrar_conexiones_activas()    # corta las conexiones ya abiertas
         self.httpd.server_close()
         self.hilo.join(timeout=3)
 
