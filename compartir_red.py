@@ -58,11 +58,15 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NOMBRE = "Compartir por red"
-APP_VERSION = "1.1"
+APP_VERSION = "1.0"
 PUERTO_DEFECTO = 8000
 DIR_APP = os.path.dirname(os.path.abspath(__file__))
 RUTA_FAVICON_APP = os.path.join(DIR_APP, "icon.ico")
 TAM_BLOQUE_SUBIDA = 65536
+TAM_BLOQUE_DESCARGA = 65536
+INTERVALO_MUESTREO_VELOCIDAD = 0.5   # segundos entre lecturas de velocidad reportadas
+UMBRAL_PAUSA_BPS = 5 * 1024          # por debajo de esto se considera "la transferencia se frenó"
+UMBRAL_CONGELADO_SEGUNDOS = 2.0       # sin ninguna actualización en este tiempo -> se ve "congelado" en vivo
 
 # --- Dependencias opcionales -------------------------------------------------
 try:
@@ -170,6 +174,8 @@ class Estado:
         self.clientes: set[str] = set()
         self.eventos: "Queue[str]" = Queue()
         self._permitir_subidas = False   # togglable en vivo, sin reiniciar el servidor
+        self.transferencias: dict[str, dict] = {}
+        self._contador_transferencias = 0
 
     def log(self, texto: str) -> None:
         self.eventos.put(f"{datetime.now():%H:%M:%S}  {texto}")
@@ -201,6 +207,47 @@ class Estado:
         with self.lock:
             return self._permitir_subidas
 
+    # ---------- transferencias en vivo (para el panel de la ventana) ----------
+    def iniciar_transferencia(self, nombre: str, ip: str, total: int | None, tipo: str) -> str:
+        with self.lock:
+            self._contador_transferencias += 1
+            id_transferencia = str(self._contador_transferencias)
+            self.transferencias[id_transferencia] = {
+                "nombre": nombre, "ip": ip, "tipo": tipo,
+                "enviados": 0, "total": total, "velocidad": 0.0,
+                "en_pausa": False, "ultima_actividad": time.time(),
+            }
+        return id_transferencia
+
+    def actualizar_transferencia(self, id_transferencia: str, enviados: int, velocidad: float) -> None:
+        registrar_pausa = registrar_reanudacion = False
+        nombre = ""
+        with self.lock:
+            info = self.transferencias.get(id_transferencia)
+            if info is None:
+                return
+            pausado_antes = info["en_pausa"]
+            pausado_ahora = velocidad < UMBRAL_PAUSA_BPS and info["enviados"] > 0
+            info["enviados"] = enviados
+            info["velocidad"] = velocidad
+            info["en_pausa"] = pausado_ahora
+            info["ultima_actividad"] = time.time()
+            nombre = info["nombre"]
+            registrar_pausa = pausado_ahora and not pausado_antes
+            registrar_reanudacion = pausado_antes and not pausado_ahora
+        if registrar_pausa:
+            self.log(f"⏸ {nombre}: la transferencia se frenó (< {formato_bytes(UMBRAL_PAUSA_BPS)}/s)")
+        elif registrar_reanudacion:
+            self.log(f"▶ {nombre}: velocidad normal de nuevo ({formato_bytes(velocidad)}/s)")
+
+    def finalizar_transferencia(self, id_transferencia: str) -> None:
+        with self.lock:
+            self.transferencias.pop(id_transferencia, None)
+
+    def snapshot_transferencias(self) -> list:
+        with self.lock:
+            return [dict(info, id=id_) for id_, info in self.transferencias.items()]
+
     def snapshot(self) -> dict:
         with self.lock:
             return {
@@ -227,18 +274,35 @@ def formato_bytes(n: float) -> str:
 class EscritorChunked:
     """Adaptador de escritura con Transfer-Encoding: chunked."""
 
-    def __init__(self, wfile) -> None:
+    def __init__(self, wfile, en_progreso=None) -> None:
         self.wfile = wfile
         self.enviados = 0
+        self._en_progreso = en_progreso
+        self._ultimo_ts = time.time()
+        self._ultimo_enviados = 0
 
     def write(self, datos) -> int:  # zipfile solo necesita write()/flush()
         if not datos:
             return 0
         n = len(datos)
+        t_inicio_bloque = time.time()
         self.wfile.write(b"%X\r\n" % n)
         self.wfile.write(datos)
         self.wfile.write(b"\r\n")
+        duracion_bloque = time.time() - t_inicio_bloque
         self.enviados += n
+        if self._en_progreso:
+            ahora = time.time()
+            if duracion_bloque >= INTERVALO_MUESTREO_VELOCIDAD:
+                velocidad = n / duracion_bloque
+                self._en_progreso(self.enviados, velocidad)
+                self._ultimo_ts = ahora
+                self._ultimo_enviados = self.enviados
+            elif ahora - self._ultimo_ts >= INTERVALO_MUESTREO_VELOCIDAD:
+                velocidad = (self.enviados - self._ultimo_enviados) / (ahora - self._ultimo_ts)
+                self._en_progreso(self.enviados, velocidad)
+                self._ultimo_ts = ahora
+                self._ultimo_enviados = self.enviados
         return n
 
     def flush(self) -> None:
@@ -570,6 +634,7 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
         except OSError:
             self.send_error(HTTPStatus.NOT_FOUND, "Archivo no encontrado")
             return
+        id_transferencia = None
         with f:
             st = os.fstat(f.fileno())
             nombre = os.path.basename(ruta_fs)
@@ -579,14 +644,51 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
             self.send_header("Content-Disposition", self.cabecera_adjunto(nombre))
             self.send_header("Last-Modified", self.date_time_string(st.st_mtime))
             self.end_headers()
+            if self.estado:
+                id_transferencia = self.estado.iniciar_transferencia(
+                    nombre, self.client_address[0], st.st_size, "descarga")
             try:
-                self.copyfile(f, self.wfile)
+                self._copiar_con_seguimiento(f, id_transferencia)
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
                 return
+            finally:
+                if id_transferencia and self.estado:
+                    self.estado.finalizar_transferencia(id_transferencia)
         if self.estado:
             self.estado.sumar_descarga(st.st_size)
             self.estado.log(f"descargó {nombre} ({formato_bytes(st.st_size)})")
+
+    def _copiar_con_seguimiento(self, origen, id_transferencia: str | None) -> int:
+        """Copia origen -> self.wfile en bloques, reportando avance/velocidad en vivo.
+
+        Un bloque individual que por sí solo ya tarda lo del umbral se reporta con SU
+        PROPIA velocidad de inmediato, en vez de promediarse con bloques rápidos
+        anteriores — de lo contrario un frenón real quedaría diluido/oculto en el promedio."""
+        enviados = 0
+        ultimo_ts = time.time()
+        ultimo_enviados = 0
+        while True:
+            trozo = origen.read(TAM_BLOQUE_DESCARGA)
+            if not trozo:
+                break
+            t_inicio_bloque = time.time()
+            self.wfile.write(trozo)
+            duracion_bloque = time.time() - t_inicio_bloque
+            enviados += len(trozo)
+            if self.estado and id_transferencia:
+                ahora = time.time()
+                if duracion_bloque >= INTERVALO_MUESTREO_VELOCIDAD:
+                    velocidad = len(trozo) / duracion_bloque
+                    self.estado.actualizar_transferencia(id_transferencia, enviados, velocidad)
+                    ultimo_ts = ahora
+                    ultimo_enviados = enviados
+                elif ahora - ultimo_ts >= INTERVALO_MUESTREO_VELOCIDAD:
+                    velocidad = (enviados - ultimo_enviados) / (ahora - ultimo_ts)
+                    self.estado.actualizar_transferencia(id_transferencia, enviados, velocidad)
+                    ultimo_ts = ahora
+                    ultimo_enviados = enviados
+        return enviados
 
     # ---------- carpeta completa en .zip generado al vuelo ----------
     def enviar_zip(self, ruta_dir: str) -> None:
@@ -607,7 +709,16 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
-        salida = EscritorChunked(self.wfile)
+        id_transferencia = None
+        if self.estado:
+            id_transferencia = self.estado.iniciar_transferencia(
+                base + ".zip", self.client_address[0], None, "descarga")
+
+        def _reportar(enviados: int, velocidad: float) -> None:
+            if self.estado and id_transferencia:
+                self.estado.actualizar_transferencia(id_transferencia, enviados, velocidad)
+
+        salida = EscritorChunked(self.wfile, en_progreso=_reportar)
         try:
             # ZIP_STORED = sin comprimir: mucho más rápido y sin uso de disco/RAM.
             with zipfile.ZipFile(salida, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
@@ -622,6 +733,9 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
             if self.estado:
                 self.estado.log(f"descarga de {base}.zip interrumpida")
             return
+        finally:
+            if id_transferencia and self.estado:
+                self.estado.finalizar_transferencia(id_transferencia)
         if self.estado:
             self.estado.sumar_descarga(salida.enviados)
             self.estado.log(
@@ -661,7 +775,7 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
 
         try:
             nombre_final, recibidos = self._recibir_archivo_multipart(
-                boundary.encode(), restante, carpeta_destino
+                boundary.encode(), restante, carpeta_destino, restante
             )
         except (ValueError, ConnectionError, OSError) as e:
             self._responder_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(e)})
@@ -723,7 +837,7 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
         return candidato
 
     def _recibir_archivo_multipart(self, boundary: bytes, restante: int,
-                                    carpeta_destino: str) -> tuple[str, int]:
+                                    carpeta_destino: str, total_peticion: int) -> tuple[str, int]:
         """Lee el cuerpo multipart/form-data DIRECTO desde el socket, en bloques,
         escribiendo el archivo a disco sin acumular su contenido completo en RAM."""
         delimitador_medio = b"\r\n--" + boundary
@@ -753,9 +867,16 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
         if not self.dentro_de_raiz(ruta_destino):  # cinturón y tirantes
             raise ValueError("nombre de archivo no permitido")
 
+        id_transferencia = None
+        if self.estado:
+            id_transferencia = self.estado.iniciar_transferencia(
+                nombre_final, self.client_address[0], total_peticion, "subida")
+
         ruta_temporal = ruta_destino + ".subiendo"
         buffer = bloque[fin_encabezados + 4:]
         escritos = 0
+        ultimo_ts = time.time()
+        ultimo_escritos = 0
         try:
             with open(ruta_temporal, "wb") as destino:
                 while True:
@@ -771,11 +892,25 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
                         buffer = buffer[seguro:]
                     if restante <= 0:
                         raise ValueError("la subida se cortó antes de terminar")
+                    t_inicio_bloque = time.time()
                     trozo = self.rfile.read(min(TAM_BLOQUE_SUBIDA, restante))
+                    duracion_bloque = time.time() - t_inicio_bloque
                     if not trozo:
                         raise ConnectionError("la conexión se cortó durante la subida")
                     restante -= len(trozo)
                     buffer += trozo
+                    if self.estado and id_transferencia:
+                        ahora = time.time()
+                        if duracion_bloque >= INTERVALO_MUESTREO_VELOCIDAD:
+                            velocidad = len(trozo) / duracion_bloque
+                            self.estado.actualizar_transferencia(id_transferencia, escritos, velocidad)
+                            ultimo_ts = ahora
+                            ultimo_escritos = escritos
+                        elif ahora - ultimo_ts >= INTERVALO_MUESTREO_VELOCIDAD:
+                            velocidad = (escritos - ultimo_escritos) / (ahora - ultimo_ts)
+                            self.estado.actualizar_transferencia(id_transferencia, escritos, velocidad)
+                            ultimo_ts = ahora
+                            ultimo_escritos = escritos
             os.replace(ruta_temporal, ruta_destino)
         except BaseException:
             try:
@@ -783,6 +918,9 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
             except OSError:
                 pass
             raise
+        finally:
+            if id_transferencia and self.estado:
+                self.estado.finalizar_transferencia(id_transferencia)
 
         # drena lo que quede del cuerpo (boundary final) para no desincronizar keep-alive
         while restante > 0:
@@ -1086,7 +1224,7 @@ class Aplicacion:
     # ---------------------------------------------------------------- widgets
     def _construir(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=1)
+        self.root.rowconfigure(4, weight=1)
         pad = {"padx": 10, "pady": 6}
 
         # --- Carpeta -------------------------------------------------------
@@ -1173,9 +1311,24 @@ class Aplicacion:
                                    highlightbackground="#d3d7de", background="white")
         self.canvas_qr.grid(row=0, column=1, padx=(8, 12), pady=8)
 
-        # --- Actividad -----------------------------------------------------
+        # --- Transferencias en curso ----------------------------------------
+        f5 = ttk.LabelFrame(self.root, text="Transferencias en curso")
+        f5.grid(row=3, column=0, sticky="ew", **pad)
+        f5.columnconfigure(0, weight=1)
+
+        columnas = ("archivo", "quien", "tipo", "progreso", "velocidad")
+        self.tabla_transferencias = ttk.Treeview(f5, columns=columnas, show="headings", height=4)
+        for col, texto, ancho in (
+            ("archivo", "Archivo", 220), ("quien", "Dispositivo", 120),
+            ("tipo", "Tipo", 70), ("progreso", "Progreso", 90), ("velocidad", "Velocidad", 100),
+        ):
+            self.tabla_transferencias.heading(col, text=texto)
+            self.tabla_transferencias.column(col, width=ancho, anchor="w")
+        self.tabla_transferencias.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+
+        # --- Actividad -------------------------------------------------------
         f4 = ttk.LabelFrame(self.root, text="Actividad")
-        f4.grid(row=3, column=0, sticky="nsew", **pad)
+        f4.grid(row=4, column=0, sticky="nsew", **pad)
         f4.columnconfigure(0, weight=1)
         f4.rowconfigure(0, weight=1)
 
@@ -1358,7 +1511,35 @@ class Aplicacion:
             f"   ·   Descargas: {s['descargas']}   ·   Enviado: {formato_bytes(s['bytes'])}"
             f"   ·   Subidas: {s['subidas']}   ·   Recibido: {formato_bytes(s['bytes_recibidos'])}{tiempo}"
         )
+        self._actualizar_transferencias()
         self.root.after(400, self._bucle_eventos)
+
+    def _actualizar_transferencias(self) -> None:
+        activas = self.estado.snapshot_transferencias()
+        ahora = time.time()
+        vistas = set()
+        for info in activas:
+            iid = info["id"]
+            vistas.add(iid)
+            if info["total"]:
+                progreso = f"{min(100, info['enviados'] * 100 // info['total'])}%"
+            else:
+                progreso = formato_bytes(info["enviados"])
+            congelado = (ahora - info["ultima_actividad"]) > UMBRAL_CONGELADO_SEGUNDOS
+            if congelado:
+                velocidad_txt = "⏸ congelado"
+            elif info["en_pausa"]:
+                velocidad_txt = f"⏸ {formato_bytes(info['velocidad'])}/s"
+            else:
+                velocidad_txt = f"{formato_bytes(info['velocidad'])}/s" if info["velocidad"] else "…"
+            valores = (info["nombre"], info["ip"], info["tipo"].capitalize(), progreso, velocidad_txt)
+            if self.tabla_transferencias.exists(iid):
+                self.tabla_transferencias.item(iid, values=valores)
+            else:
+                self.tabla_transferencias.insert("", "end", iid=iid, values=valores)
+        for iid in list(self.tabla_transferencias.get_children()):
+            if iid not in vistas:
+                self.tabla_transferencias.delete(iid)
 
     def _cerrar(self) -> None:
         if self.servidor and not messagebox.askyesno(APP_NOMBRE, "El servidor está activo. ¿Salir y detenerlo?"):
