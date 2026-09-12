@@ -37,6 +37,7 @@ import argparse
 import html
 import io
 import ipaddress
+import json
 import os
 import socket
 import string
@@ -57,9 +58,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NOMBRE = "Compartir por red"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 PUERTO_DEFECTO = 8000
 DIR_APP = os.path.dirname(os.path.abspath(__file__))
+RUTA_FAVICON_APP = os.path.join(DIR_APP, "icon.ico")
+TAM_BLOQUE_SUBIDA = 65536
 
 # --- Dependencias opcionales -------------------------------------------------
 try:
@@ -162,8 +165,11 @@ class Estado:
         self.conexiones = 0        # peticiones en curso
         self.descargas = 0         # archivos/zip servidos
         self.bytes = 0             # bytes enviados
+        self.subidas = 0           # archivos recibidos por subida
+        self.bytes_recibidos = 0   # bytes recibidos por subida
         self.clientes: set[str] = set()
         self.eventos: "Queue[str]" = Queue()
+        self._permitir_subidas = False   # togglable en vivo, sin reiniciar el servidor
 
     def log(self, texto: str) -> None:
         self.eventos.put(f"{datetime.now():%H:%M:%S}  {texto}")
@@ -182,6 +188,19 @@ class Estado:
             self.descargas += 1
             self.bytes += n_bytes
 
+    def sumar_subida(self, n_bytes: int) -> None:
+        with self.lock:
+            self.subidas += 1
+            self.bytes_recibidos += n_bytes
+
+    def permitir_subidas(self, valor: bool) -> None:
+        with self.lock:
+            self._permitir_subidas = bool(valor)
+
+    def subidas_permitidas(self) -> bool:
+        with self.lock:
+            return self._permitir_subidas
+
     def snapshot(self) -> dict:
         with self.lock:
             return {
@@ -189,6 +208,8 @@ class Estado:
                 "descargas": self.descargas,
                 "bytes": self.bytes,
                 "clientes": len(self.clientes),
+                "subidas": self.subidas,
+                "bytes_recibidos": self.bytes_recibidos,
             }
 
 
@@ -264,6 +285,25 @@ PLANTILLA = string.Template("""<!DOCTYPE html>
   .tam, .fecha { color:#6b7280; white-space:nowrap; }
   .acc { text-align:right; white-space:nowrap; }
   .pie { margin:14px 0 30px; color:#6b7280; font-size:12px; text-align:center; }
+  .zona-subida { border:2px dashed #9aa2af; border-radius:10px; padding:18px; text-align:center;
+                 margin-bottom:14px; color:#6b7280; font-size:14px; transition:.15s; }
+  .zona-subida.sobre { border-color:#2563eb; background:rgba(37,99,235,.06); color:#2563eb; }
+  .zona-subida input[type=file] { display:none; }
+  .zona-subida .btn { margin-top:8px; }
+  .aviso-deshabilitado { color:#6b7280; font-size:13px; font-style:italic; margin-bottom:14px; }
+  .cola-subidas { margin-bottom:16px; display:flex; flex-direction:column; gap:8px; }
+  .item-subida { background:#fff; border:1px solid #eceef2; border-radius:8px; padding:10px 12px;
+                 font-size:13px; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+  .item-subida .fila-superior { display:flex; justify-content:space-between; gap:10px;
+                                 margin-bottom:6px; word-break:break-all; }
+  .item-subida .barra { height:8px; background:#e5e7eb; border-radius:6px; overflow:hidden; }
+  .item-subida .barra > div { height:100%; background:#2563eb; width:0%; transition:width .15s; }
+  .item-subida .detalle { display:flex; justify-content:space-between; margin-top:6px;
+                           color:#6b7280; font-size:12px; }
+  .item-subida.completado .barra > div { background:#15803d; }
+  .item-subida.completado .detalle { color:#15803d; }
+  .item-subida.error .barra > div { background:#b91c1c; }
+  .item-subida.error .detalle { color:#b91c1c; }
   @media (max-width:600px) { .fecha { display:none; } }
   @media (prefers-color-scheme: dark) {
     body { background:#14161a; color:#e6e8ec; }
@@ -274,6 +314,10 @@ PLANTILLA = string.Template("""<!DOCTYPE html>
     .btn { background:#22262d; border-color:#333a44; color:#e6e8ec; }
     .btn.primario { background:#2563eb; border-color:#2563eb; color:#fff; }
     input[type=search] { background:#22262d; border-color:#333a44; color:#e6e8ec; }
+    .zona-subida { border-color:#3a4049; color:#9aa2af; }
+    .zona-subida.sobre { background:rgba(37,99,235,.14); }
+    .item-subida { background:#1c1f25; border-color:#2a2f37; box-shadow:none; }
+    .item-subida .barra { background:#2a2f37; }
   }
 </style>
 </head><body>
@@ -287,6 +331,7 @@ PLANTILLA = string.Template("""<!DOCTYPE html>
     <a class="btn primario" href="?zip=1">⬇ Descargar esta carpeta (.zip)</a>
     <input type="search" id="filtro" placeholder="Filtrar por nombre…" autocomplete="off">
   </div>
+  $bloque_subidas
   <table id="tabla">
     <thead><tr><th>Nombre</th><th>Tamaño</th><th class="fecha">Modificado</th><th class="acc">Descargar</th></tr></thead>
     <tbody>
@@ -305,6 +350,131 @@ $filas
       filas[i].style.display = n.indexOf(q) === -1 ? 'none' : '';
     }
   });
+
+  var SUBIDAS_HABILITADAS = $subidas_habilitadas_js;
+  var RUTA_ACTUAL = $ruta_actual_js;
+
+  if (SUBIDAS_HABILITADAS) {
+    var zona = document.getElementById('zonaSubida');
+    var input = document.getElementById('inputArchivos');
+    var cola = document.getElementById('colaSubidas');
+    var btnSel = document.getElementById('btnSeleccionar');
+
+    btnSel.addEventListener('click', function () { input.click(); });
+    input.addEventListener('change', function () { encolar(input.files); input.value = ''; });
+
+    ['dragenter', 'dragover'].forEach(function (ev) {
+      zona.addEventListener(ev, function (e) { e.preventDefault(); zona.classList.add('sobre'); });
+    });
+    ['dragleave', 'drop'].forEach(function (ev) {
+      zona.addEventListener(ev, function (e) { e.preventDefault(); zona.classList.remove('sobre'); });
+    });
+    zona.addEventListener('drop', function (e) {
+      if (e.dataTransfer && e.dataTransfer.files) encolar(e.dataTransfer.files);
+    });
+
+    var pendientes = [];
+    var subiendoAhora = false;
+    var seSubioAlgo = false;
+
+    function encolar(lista) {
+      for (var i = 0; i < lista.length; i++) pendientes.push(lista[i]);
+      procesarCola();
+    }
+
+    function formatoBytes(n) {
+      var unidades = ['B', 'KB', 'MB', 'GB'];
+      var i = 0;
+      while (n >= 1024 && i < unidades.length - 1) { n /= 1024; i++; }
+      return n.toFixed(i === 0 ? 0 : 1) + ' ' + unidades[i];
+    }
+
+    function procesarCola() {
+      if (subiendoAhora) return;
+      if (pendientes.length === 0) {
+        if (seSubioAlgo) { seSubioAlgo = false; setTimeout(function () { location.reload(); }, 700); }
+        return;
+      }
+      subiendoAhora = true;
+      var archivo = pendientes.shift();
+      subirArchivo(archivo, function () {
+        subiendoAhora = false;
+        procesarCola();
+      });
+    }
+
+    function subirArchivo(archivo, alTerminar) {
+      var item = document.createElement('div');
+      item.className = 'item-subida';
+      item.innerHTML =
+        '<div class="fila-superior"><span class="nombre"></span><span class="porcentaje">0%</span></div>' +
+        '<div class="barra"><div></div></div>' +
+        '<div class="detalle"><span class="tamano"></span><span class="velocidad"></span></div>';
+      item.querySelector('.nombre').textContent = archivo.name;
+      item.querySelector('.tamano').textContent = '0 B / ' + formatoBytes(archivo.size);
+      cola.insertBefore(item, cola.firstChild);
+
+      var relleno = item.querySelector('.barra > div');
+      var porcentajeEl = item.querySelector('.porcentaje');
+      var tamanoEl = item.querySelector('.tamano');
+      var velocidadEl = item.querySelector('.velocidad');
+
+      var formulario = new FormData();
+      formulario.append('archivo', archivo, archivo.name);
+
+      var xhr = new XMLHttpRequest();
+      var urlSubida = '?subir=1' + (RUTA_ACTUAL ? '&ruta=' + encodeURIComponent(RUTA_ACTUAL) : '');
+      xhr.open('POST', urlSubida);
+
+      var ultimoTiempo = Date.now();
+      var ultimoCargado = 0;
+
+      xhr.upload.addEventListener('progress', function (e) {
+        if (!e.lengthComputable) return;
+        var porcentaje = Math.round((e.loaded / e.total) * 100);
+        relleno.style.width = porcentaje + '%';
+        porcentajeEl.textContent = porcentaje + '%';
+        tamanoEl.textContent = formatoBytes(e.loaded) + ' / ' + formatoBytes(e.total);
+
+        var ahora = Date.now();
+        var delta = (ahora - ultimoTiempo) / 1000;
+        if (delta >= 0.3) {
+          var velocidad = (e.loaded - ultimoCargado) / delta;
+          velocidadEl.textContent = formatoBytes(velocidad) + '/s';
+          ultimoTiempo = ahora;
+          ultimoCargado = e.loaded;
+        }
+      });
+
+      xhr.addEventListener('load', function () {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          item.classList.add('completado');
+          relleno.style.width = '100%';
+          porcentajeEl.textContent = '✓ Subida completada';
+          velocidadEl.textContent = '';
+          seSubioAlgo = true;
+        } else {
+          item.classList.add('error');
+          porcentajeEl.textContent = '✗ Error';
+          try {
+            var resp = JSON.parse(xhr.responseText);
+            velocidadEl.textContent = resp.error || ('HTTP ' + xhr.status);
+          } catch (err) {
+            velocidadEl.textContent = 'HTTP ' + xhr.status;
+          }
+        }
+        alTerminar();
+      });
+
+      xhr.addEventListener('error', function () {
+        item.classList.add('error');
+        porcentajeEl.textContent = '✗ Error de red';
+        alTerminar();
+      });
+
+      xhr.send(formulario);
+    }
+  }
 </script>
 </body></html>
 """)
@@ -356,6 +526,11 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
     # ---------- enrutado ----------
     def do_GET(self) -> None:
         partes = urllib.parse.urlsplit(self.path)
+
+        if partes.path == "/favicon.ico":
+            self._servir_favicon()
+            return
+
         params = urllib.parse.parse_qs(partes.query)
         ruta_fs = self.translate_path(self.path)
 
@@ -372,6 +547,21 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
             return
 
         super().do_GET()
+
+    def _servir_favicon(self) -> None:
+        try:
+            with open(RUTA_FAVICON_APP, "rb") as f:
+                datos = f.read()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/vnd.microsoft.icon")
+            self.send_header("Content-Length", str(len(datos)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(datos)
+        except OSError:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     # ---------- descarga forzada de un archivo ----------
     def enviar_adjunto(self, ruta_fs: str) -> None:
@@ -438,6 +628,182 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
                 f"descargó {base}.zip · {len(archivos)} archivos · {formato_bytes(salida.enviados)}"
             )
 
+    # ---------- subida de archivos (POST) ----------
+    def do_POST(self) -> None:
+        if not (self.estado and self.estado.subidas_permitidas()):
+            self.send_error(HTTPStatus.FORBIDDEN, "La subida de archivos está deshabilitada")
+            return
+
+        partes = urllib.parse.urlsplit(self.path)
+        params = urllib.parse.parse_qs(partes.query)
+        carpeta_destino = self._resolver_carpeta_destino(params.get("ruta", [""])[0])
+        if carpeta_destino is None:
+            self.send_error(HTTPStatus.FORBIDDEN, "Carpeta de destino no permitida")
+            return
+
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("multipart/form-data"):
+            self.send_error(HTTPStatus.BAD_REQUEST, "Se esperaba multipart/form-data")
+            return
+        boundary = self._extraer_boundary(ctype)
+        if not boundary:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Falta boundary en Content-Type")
+            return
+
+        try:
+            restante = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self.send_error(HTTPStatus.LENGTH_REQUIRED, "Falta Content-Length")
+            return
+        if restante <= 0:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Cuerpo de la petición vacío")
+            return
+
+        try:
+            nombre_final, recibidos = self._recibir_archivo_multipart(
+                boundary.encode(), restante, carpeta_destino
+            )
+        except (ValueError, ConnectionError, OSError) as e:
+            self._responder_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(e)})
+            return
+
+        if self.estado:
+            self.estado.sumar_subida(recibidos)
+            self.estado.log(
+                f"{self.client_address[0]} → subió {nombre_final} ({formato_bytes(recibidos)})"
+            )
+        self._responder_json(HTTPStatus.OK, {"ok": True, "nombre": nombre_final, "bytes": recibidos})
+
+    def _resolver_carpeta_destino(self, ruta_rel: str) -> str | None:
+        """Convierte el parámetro ?ruta= (subcarpeta que el navegador está viendo)
+        en una ruta absoluta, verificando que no se salga de la carpeta compartida."""
+        ruta_rel = urllib.parse.unquote(ruta_rel).lstrip("/\\")
+        candidata = os.path.normpath(os.path.join(self.raiz, ruta_rel))
+        if not self.dentro_de_raiz(candidata) or not os.path.isdir(candidata):
+            return None
+        return candidata
+
+    @staticmethod
+    def _extraer_boundary(content_type: str) -> str | None:
+        for trozo in content_type.split(";"):
+            trozo = trozo.strip()
+            if trozo.startswith("boundary="):
+                return trozo[len("boundary="):].strip('"')
+        return None
+
+    @staticmethod
+    def _parsear_content_disposition(encabezados: bytes) -> dict:
+        resultado: dict = {}
+        for linea in encabezados.decode("utf-8", errors="replace").split("\r\n"):
+            if not linea.lower().startswith("content-disposition:"):
+                continue
+            for trozo in linea.split(";")[1:]:
+                trozo = trozo.strip()
+                if "=" in trozo:
+                    clave, _, valor = trozo.partition("=")
+                    resultado[clave.strip().lower()] = valor.strip().strip('"')
+        return resultado
+
+    @staticmethod
+    def _nombre_de_archivo_seguro(nombre: str, carpeta_destino: str) -> str:
+        """Descarta cualquier componente de ruta del nombre (protección contra ../ y
+        rutas absolutas) y evita colisiones renombrando en vez de sobrescribir."""
+        nombre = os.path.basename(nombre.replace("\\", "/").strip())
+        if not nombre or nombre in (".", ".."):
+            nombre = "archivo_subido"
+        elif nombre.startswith("."):
+            nombre = "_" + nombre.lstrip(".") or "_archivo_subido"
+
+        base, ext = os.path.splitext(nombre)
+        candidato = nombre
+        contador = 1
+        while os.path.exists(os.path.join(carpeta_destino, candidato)):
+            candidato = f"{base} ({contador}){ext}"
+            contador += 1
+        return candidato
+
+    def _recibir_archivo_multipart(self, boundary: bytes, restante: int,
+                                    carpeta_destino: str) -> tuple[str, int]:
+        """Lee el cuerpo multipart/form-data DIRECTO desde el socket, en bloques,
+        escribiendo el archivo a disco sin acumular su contenido completo en RAM."""
+        delimitador_medio = b"\r\n--" + boundary
+
+        bloque = self.rfile.read(min(restante, 8192))
+        restante -= len(bloque)
+        fin_encabezados = bloque.find(b"\r\n\r\n")
+        intentos = 0
+        while fin_encabezados == -1 and restante > 0 and intentos < 8:
+            extra = self.rfile.read(min(restante, 8192))
+            if not extra:
+                break
+            restante -= len(extra)
+            bloque += extra
+            fin_encabezados = bloque.find(b"\r\n\r\n")
+            intentos += 1
+        if fin_encabezados == -1:
+            raise ValueError("no se pudieron leer los encabezados de la subida")
+
+        disposicion = self._parsear_content_disposition(bloque[:fin_encabezados])
+        nombre_original = disposicion.get("filename")
+        if not nombre_original:
+            raise ValueError("la subida no incluye un archivo (falta filename)")
+
+        nombre_final = self._nombre_de_archivo_seguro(nombre_original, carpeta_destino)
+        ruta_destino = os.path.join(carpeta_destino, nombre_final)
+        if not self.dentro_de_raiz(ruta_destino):  # cinturón y tirantes
+            raise ValueError("nombre de archivo no permitido")
+
+        ruta_temporal = ruta_destino + ".subiendo"
+        buffer = bloque[fin_encabezados + 4:]
+        escritos = 0
+        try:
+            with open(ruta_temporal, "wb") as destino:
+                while True:
+                    idx = buffer.find(delimitador_medio)
+                    if idx != -1:
+                        destino.write(buffer[:idx])
+                        escritos += idx
+                        break
+                    seguro = len(buffer) - (len(delimitador_medio) - 1)
+                    if seguro > 0:
+                        destino.write(buffer[:seguro])
+                        escritos += seguro
+                        buffer = buffer[seguro:]
+                    if restante <= 0:
+                        raise ValueError("la subida se cortó antes de terminar")
+                    trozo = self.rfile.read(min(TAM_BLOQUE_SUBIDA, restante))
+                    if not trozo:
+                        raise ConnectionError("la conexión se cortó durante la subida")
+                    restante -= len(trozo)
+                    buffer += trozo
+            os.replace(ruta_temporal, ruta_destino)
+        except BaseException:
+            try:
+                os.remove(ruta_temporal)
+            except OSError:
+                pass
+            raise
+
+        # drena lo que quede del cuerpo (boundary final) para no desincronizar keep-alive
+        while restante > 0:
+            trozo = self.rfile.read(min(TAM_BLOQUE_SUBIDA, restante))
+            if not trozo:
+                break
+            restante -= len(trozo)
+
+        return nombre_final, escritos
+
+    def _responder_json(self, codigo: HTTPStatus, datos: dict) -> None:
+        cuerpo = json.dumps(datos).encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        try:
+            self.wfile.write(cuerpo)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
     @staticmethod
     def cabecera_adjunto(nombre: str) -> str:
         seguro = nombre.encode("ascii", "replace").decode("ascii").replace('"', "_")
@@ -488,6 +854,21 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
             filas.append('      <tr><td colspan="4">Carpeta vacía</td></tr>')
 
         arriba = "" if ruta_url in ("/", "") else '<a class="btn" href="../">⬆ Subir</a>'
+
+        subidas_habilitadas = bool(self.estado and self.estado.subidas_permitidas())
+        if subidas_habilitadas:
+            bloque_subidas = (
+                '<div class="zona-subida" id="zonaSubida">'
+                '<div>⬆ Arrastra archivos aquí, o</div>'
+                '<button type="button" class="btn primario" id="btnSeleccionar">Seleccionar archivos</button>'
+                '<input type="file" id="inputArchivos" multiple>'
+                '</div>'
+                '<div class="cola-subidas" id="colaSubidas"></div>'
+            )
+        else:
+            bloque_subidas = ('<div class="aviso-deshabilitado">'
+                               'El anfitrión no permite subir archivos a esta carpeta.</div>')
+
         pagina = PLANTILLA.substitute(
             titulo=html.escape(titulo),
             ruta=html.escape(ruta_url),
@@ -496,6 +877,9 @@ class ManejadorCompartir(SimpleHTTPRequestHandler):
             resumen=f"{n_dir} carpetas · {n_arch} archivos",
             app=APP_NOMBRE,
             version=APP_VERSION,
+            bloque_subidas=bloque_subidas,
+            subidas_habilitadas_js=("true" if subidas_habilitadas else "false"),
+            ruta_actual_js=json.dumps(ruta_url),
         ).encode("utf-8", "surrogateescape")
 
         self.send_response(HTTPStatus.OK)
@@ -673,8 +1057,10 @@ class Aplicacion:
         self.var_ip = tk.StringVar()
         self.var_direccion = tk.StringVar(value="—")
         self.var_solo_esta_ip = tk.BooleanVar(value=False)
+        self.var_permitir_subidas = tk.BooleanVar(value=False)
         self.var_estado = tk.StringVar(value="Detenido")
-        self.var_metricas = tk.StringVar(value="Conexiones: 0   ·   Descargas: 0   ·   Enviado: 0 B")
+        self.var_metricas = tk.StringVar(value="Conexiones: 0   ·   Descargas: 0   ·   Enviado: 0 B"
+                                                "   ·   Subidas: 0   ·   Recibido: 0 B")
         self.var_contenido = tk.StringVar(value="—")
 
         self._poner_icono()
@@ -727,6 +1113,11 @@ class Aplicacion:
 
         self.lbl_contenido = ttk.Label(f1, textvariable=self.var_contenido, foreground="#555")
         self.lbl_contenido.grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+
+        self.chk_subidas = ttk.Checkbutton(
+            f1, text="Permitir que quien se conecte también pueda subir archivos aquí",
+            variable=self.var_permitir_subidas, command=self._cambiar_permitir_subidas)
+        self.chk_subidas.grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
 
         # --- Red -----------------------------------------------------------
         f2 = ttk.LabelFrame(self.root, text="Red")
@@ -866,6 +1257,11 @@ class Aplicacion:
         else:
             self.var_contenido.set("⚠ La ruta no existe o no es una carpeta")
 
+    def _cambiar_permitir_subidas(self) -> None:
+        habilitado = self.var_permitir_subidas.get()
+        self.estado.permitir_subidas(habilitado)
+        self.estado.log("subida de archivos " + ("habilitada" if habilitado else "deshabilitada"))
+
     def _alternar(self) -> None:
         self._detener() if self.servidor else self._iniciar()
 
@@ -959,7 +1355,8 @@ class Aplicacion:
             tiempo = f"   ·   Activo: {seg // 3600:02d}:{seg % 3600 // 60:02d}:{seg % 60:02d}"
         self.var_metricas.set(
             f"Conexiones activas: {s['conexiones']}   ·   Dispositivos: {s['clientes']}"
-            f"   ·   Descargas: {s['descargas']}   ·   Enviado: {formato_bytes(s['bytes'])}{tiempo}"
+            f"   ·   Descargas: {s['descargas']}   ·   Enviado: {formato_bytes(s['bytes'])}"
+            f"   ·   Subidas: {s['subidas']}   ·   Recibido: {formato_bytes(s['bytes_recibidos'])}{tiempo}"
         )
         self.root.after(400, self._bucle_eventos)
 
