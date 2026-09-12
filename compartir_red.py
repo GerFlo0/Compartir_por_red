@@ -58,7 +58,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NOMBRE = "Compartir por red"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1.2"
 PUERTO_DEFECTO = 8000
 DIR_APP = os.path.dirname(os.path.abspath(__file__))
 RUTA_FAVICON_APP = os.path.join(DIR_APP, "icon.ico")
