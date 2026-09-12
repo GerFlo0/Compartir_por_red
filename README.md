@@ -76,7 +76,8 @@ python compartir_red.py --crear-icono     # regenera icon.png / icon.ico
 4. Comparte la dirección con **⧉ Copiar dirección** o escaneando el **QR** desde el celular.
 
 - **Escuchar solo en esta IP**: sin marcar, el servidor escucha en `0.0.0.0` (accesible por todas las interfaces); marcado, solo por la IP seleccionada. Selecciona `127.0.0.1` + esa casilla para una prueba local que nadie más ve.
-- El panel **Actividad** registra cada petición, con IP del dispositivo, y los contadores muestran conexiones activas, dispositivos distintos, descargas y bytes enviados.
+- **Permitir que quien se conecte también pueda subir archivos aquí**: desmarcada por defecto. Se puede prender o apagar en cualquier momento, incluso con el servidor ya corriendo — no hace falta reiniciarlo.
+- El panel **Actividad** registra cada petición, con IP del dispositivo, y los contadores muestran conexiones activas, dispositivos distintos, descargas, bytes enviados, subidas recibidas y bytes recibidos.
 
 ## 5. Lo que ve quien entra
 
@@ -85,12 +86,21 @@ Listado propio (responsive, modo oscuro automático) con:
 | Acción | Cómo |
 |---|---|
 | Abrir archivo en el navegador | clic en el nombre |
-| **Descargar archivo sin abrirlo** | botón `⬇` de la fila → `?dl=1` (`Content-Disposition: attachment`) |
-| **Descargar una carpeta completa** | botón `⬇ .zip` de la fila → `?zip=1` |
-| Descargar toda la carpeta compartida | botón `⬇ Descargar esta carpeta (.zip)` |
+| **Descargar archivo sin abrirlo** | botón `⬇️` de la fila → `?dl=1` (`Content-Disposition: attachment`) |
+| **Descargar una carpeta completa** | botón `⬇️ .zip` de la fila → `?zip=1` |
+| Descargar toda la carpeta compartida | botón `⬇️ Descargar esta carpeta (.zip)` |
 | Filtrar por nombre | campo de búsqueda |
+| **Subir archivos** (si está habilitado) | botón **Seleccionar archivos**, o arrastrar y soltar sobre la zona punteada |
 
 El `.zip` se genera **al vuelo** con `Transfer-Encoding: chunked` y `ZIP_STORED`: no crea archivos temporales, no consume RAM proporcional al tamaño y la descarga empieza al instante (soporta >4 GB con Zip64). Los archivos y carpetas ocultos (`.algo`) se omiten tanto del listado como del zip.
+
+Cuando la subida está habilitada, la página permite seleccionar varios archivos a la vez (o arrastrarlos) y muestra, por cada uno, una barra de progreso, el porcentaje, la velocidad de transferencia y el tamaño enviado; al terminar toda la cola, la página se recarga sola para mostrar los archivos nuevos. Las subidas se reciben en bloques directo a disco (no se acumula el archivo completo en memoria), y quedan registradas en el panel **Actividad** con la IP de quien subió, por ejemplo:
+
+
+11:32:05  192.168.1.25 → subió foto.jpg (4.2 MB)
+
+
+Si dos personas suben un archivo con el mismo nombre, el segundo se renombra automáticamente (`foto (1).jpg`) en vez de sobrescribir el original. Cualquier intento de subir con un nombre que contenga `../` o rutas se sanea del lado del servidor antes de tocar el disco. 
 
 ## 6. Notas técnicas
 
@@ -173,7 +183,8 @@ Notas:
 
 ## 8. Seguridad
 
-- **No hay autenticación**: cualquiera en la red con la dirección puede ver y descargar la carpeta. Úsalo en redes de confianza y detén el servidor al terminar.
-- Es solo lectura: no permite subir, borrar ni modificar nada.
+- **No hay autenticación**: cualquiera en la red con la dirección puede ver y descargar la carpeta (y subir archivos, si lo habilitaste). Úsalo en redes de confianza y detén el servidor al terminar.
+- Por defecto es solo lectura: la casilla de subida viene **desmarcada**. Solo permite subir, borrar o modificar nada si tú la activas explícitamente.
+- Si habilitas la subida, no hay límite de tamaño por archivo ni revisión de contenido — alguien podría llenar el disco o subir algo no deseado. Actívala solo cuando la necesites y con gente de confianza.
 - No expongas el puerto a Internet (sin port forwarding).
 - Comparte la carpeta más específica posible, no la raíz del disco ni tu perfil de usuario completo.
